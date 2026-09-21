@@ -1,0 +1,28 @@
+{
+    "detection_mode": "template",
+    "confidence": 0.85,
+    "click_delay": 0.3,
+    "capture_region": {
+        "x": 0,
+        "y": 0,
+        "width": 1920,
+        "height": 1080
+    },
+    "hotkeys": {
+        "start": "f6",
+        "stop": "f7",
+        "pause": "f8",
+        "select_region": "f9"
+    },
+    "max_clicks_per_second": 10,
+    "cooldown_ms": 300,
+    "detection_interval_ms": 50,
+    "color_detection": {
+        "hue_min": 0,
+        "hue_max": 10,
+        "sat_min": 100,
+        "sat_max": 255,
+        "val_min": 100,
+        "val_max": 255
+    }
+}

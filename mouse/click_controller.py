@@ -2,10 +2,8 @@
 mouse/click_controller.py — Mouse control with multiple click modes.
 
 Click Modes:
-  "normal"       — PyAutoGUI SendInput (requires Roblox to be focused)
-  "sendinput"    — ctypes SendInput directly (fastest, still needs focus)
-  "directwindow" — PostMessage WM_LBUTTONDOWN to target window handle
-                   (works WITHOUT focus — best for fullscreen games)
+  "normal"    — PyAutoGUI click (needs the target window focused)
+  "sendinput" — ctypes SendInput directly (fastest, still needs focus)
 """
 
 from __future__ import annotations
@@ -19,6 +17,10 @@ from utils.logger import get_logger
 log = get_logger("mouse")
 
 pyautogui.FAILSAFE = True
+# PyAutoGUI defaults to all four corners. The app promises top-left only, and the
+# bottom corners are where Windows' Start button / Show desktop live, so other
+# corners would stop a run by surprise.
+pyautogui.FAILSAFE_POINTS = [(0, 0)]
 pyautogui.PAUSE = 0.005  # Reduce pyautogui inter-call pause
 
 # ── ctypes structures for SendInput ────────────────────────────────────────
@@ -29,6 +31,22 @@ MOUSEEVENTF_ABSOLUTE    = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 
 INPUT_MOUSE = 0
+
+SM_XVIRTUALSCREEN  = 76
+SM_YVIRTUALSCREEN  = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+
+def enable_dpi_awareness():
+    """Make this process DPI-aware so screen coords are physical pixels."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
@@ -54,10 +72,15 @@ MK_LBUTTON     = 0x0001
 
 def _send_input_click(x: int, y: int):
     """Move mouse and click using ctypes SendInput (no pyautogui overhead)."""
-    screen_w = ctypes.windll.user32.GetSystemMetrics(0)
-    screen_h = ctypes.windll.user32.GetSystemMetrics(1)
-    abs_x = int(x * 65535 / screen_w)
-    abs_y = int(y * 65535 / screen_h)
+    # MOUSEEVENTF_VIRTUALDESK maps 0..65535 onto the whole virtual desktop
+    # (all monitors), so normalise against the virtual screen, not the primary.
+    user32 = ctypes.windll.user32
+    vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    vw = max(2, user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+    vh = max(2, user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    abs_x = int((x - vx) * 65535 / (vw - 1))
+    abs_y = int((y - vy) * 65535 / (vh - 1))
 
     inputs = (INPUT * 3)()
 
@@ -125,6 +148,10 @@ class ClickController:
     def max_clicks_per_second(self, value: int):
         self._min_interval = 1.0 / max(1, value)
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
     def enable(self):
         self._enabled = True
 
@@ -152,6 +179,31 @@ class ClickController:
             return False
 
     # ── Click ──────────────────────────────────────────────────────────
+
+    def ready(self, override_delay_ms: int | None = None) -> bool:
+        """True if enabled and cooldown/rate-limit allow a click right now."""
+        if not self._enabled:
+            return False
+        cooldown = self._cooldown_sec if override_delay_ms is None else override_delay_ms / 1000.0
+        with self._lock:
+            elapsed = time.monotonic() - self._last_click_time
+            return elapsed >= max(cooldown, self._min_interval)
+
+    def failsafe_tripped(self) -> bool:
+        """True (and the controller disables itself) if the mouse sits in a
+        PyAutoGUI FailSafe corner. Lets long waits honour the emergency stop,
+        which otherwise only fires inside a pyautogui call."""
+        if not pyautogui.FAILSAFE:
+            return False
+        try:
+            pos = tuple(pyautogui.position())
+        except Exception:
+            return False
+        if pos in getattr(pyautogui, "FAILSAFE_POINTS", [(0, 0)]):
+            log.warning("FailSafe corner reached — disabling clicks.")
+            self.disable()
+            return True
+        return False
 
     def click(self, x: int | None = None, y: int | None = None, override_delay_ms: int | None = None) -> bool:
         """Click at (x, y), respecting cooldown / rate limiting."""
@@ -195,9 +247,16 @@ class ClickController:
             except pyautogui.FailSafeException:
                 log.warning("FailSafe triggered during click.")
                 self.disable()
+                raise  # the click did not happen; click() must not count it
 
     def move_and_click(self, x: int, y: int, duration: float = 0.03, override_delay_ms: int | None = None) -> bool:
-        """Helper to move mouse and then click immediately."""
+        """Helper to move mouse and then click immediately.
+
+        Rate limit is checked BEFORE moving so the cursor is not dragged to the
+        target on every frame while a click is still cooling down.
+        """
+        if not self.ready(override_delay_ms):
+            return False
         if self.move_to(x, y, duration):
             return self.click(x, y, override_delay_ms)
         return False

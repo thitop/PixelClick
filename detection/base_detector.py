@@ -19,7 +19,8 @@ class DetectionResult:
     height: int = 0
     confidence: float = 0.0
     error: str = ""   # Non-empty when something is misconfigured
-    action_delay_ms: int = -1
+    pre_click_delay_ms: int = 0   # wait this long after detection before clicking
+    template_index: int = -1      # which image matched (multi-image detectors); -1 = n/a
 
     @property
     def center(self) -> tuple[int, int]:

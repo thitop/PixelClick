@@ -52,6 +52,7 @@ class DetectionWorker:
         self._running: bool = False
         self._paused: bool = False
         self._thread: threading.Thread | None = None
+        self._join_timeout: float = 2.0
 
         # Metrics
         self._fps: float = 0.0
@@ -79,9 +80,16 @@ class DetectionWorker:
 
     # ── Control ────────────────────────────────────────────────────────
 
-    def start(self):
+    def start(self) -> bool:
         if self._running:
-            return
+            return False
+        # Never run two loops at once: if a previous thread outlived stop()'s
+        # join (e.g. a slow full-screen detect), wait for it or refuse.
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=self._join_timeout)
+            if self._thread.is_alive():
+                log.warning("Previous detection thread still running; not starting.")
+                return False
         self._running = True
         self._paused = False
         self._click.enable()
@@ -89,12 +97,13 @@ class DetectionWorker:
         self._thread = threading.Thread(target=self._run, daemon=True, name="DetectionWorker")
         self._thread.start()
         log.info("Detection worker started.")
+        return True
 
     def stop(self):
         self._running = False
         self._click.disable()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=self._join_timeout)
         log.info("Detection worker stopped.")
 
     def pause(self):
@@ -131,6 +140,15 @@ class DetectionWorker:
 
     def _run(self):
         """Main detection loop running on the worker thread."""
+        try:
+            self._loop()
+        finally:
+            # The capture keeps a per-thread GDI handle; release it on this thread.
+            close = getattr(self._capture, "close", None)
+            if close:
+                close()
+
+    def _loop(self):
         while self._running:
             if self._paused:
                 time.sleep(0.05)
@@ -139,25 +157,7 @@ class DetectionWorker:
             t_start = time.monotonic()
 
             try:
-                frame = self._capture_frame()
-                result = self._detect(frame)
-                annotated = self._annotate(frame.copy(), result)
-                self._last_frame = annotated
-
-                if result.found and self._auto_click:
-                    rx = self._region["x"] if self._region else 0
-                    ry = self._region["y"] if self._region else 0
-                    abs_x = result.x + rx
-                    abs_y = result.y + ry
-                    
-                    delay = result.action_delay_ms if result.action_delay_ms >= 0 else None
-                    clicked = self._click.move_and_click(abs_x, abs_y, override_delay_ms=delay)
-                    
-                    if clicked and self._detector:
-                        self._detector.advance()
-
-                self._push_update(result)
-
+                self._step()
             except Exception as e:
                 log.error(f"Worker loop error: {e}", exc_info=True)
 
@@ -169,6 +169,71 @@ class DetectionWorker:
             sleep_sec = max(0.0, self._interval_ms / 1000.0 - elapsed)
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
+
+    def _step(self):
+        """One iteration: capture -> detect -> [wait -> re-detect] -> click -> report."""
+        # Emergency stop must work even when nothing is about to be clicked
+        # (no target, or cooling down); PyAutoGUI only checks inside its calls.
+        if self._click.failsafe_tripped():
+            self._push_update(DetectionResult(found=False))  # carries failsafe=True
+            return
+        frame = self._capture_frame()
+        result = self._detect(frame)
+        self._last_frame = self._annotate(frame.copy(), result)
+
+        if result.found and self._auto_click and self._click.ready():
+            delay_s = result.pre_click_delay_ms / 1000.0
+            if delay_s > 0:
+                first = result
+                waited_for = first.template_index
+                self._push_update(first, waiting=True)
+
+                def tick():  # keep preview, timer and status alive during a long wait
+                    now_frame = self._capture_frame()
+                    self._last_frame = self._annotate(now_frame.copy(), first)
+                    self._push_update(first, waiting=True)
+
+                if not self._wait_interruptible(delay_s, on_tick=tick):
+                    # Stop / Pause / FailSafe during the wait: no click. Clear the
+                    # "waiting" flag so the UI does not claim a click is coming.
+                    self._push_update(first)
+                    return
+                # The screen may have changed while we waited: look again and
+                # click where the target is now (or not at all if it is gone).
+                frame = self._capture_frame()
+                result = self._detect(frame)
+                self._last_frame = self._annotate(frame.copy(), result)
+                if result.found and result.template_index != waited_for:
+                    # A different image matched (First Found mode). Its own wait
+                    # has not happened yet, so do not click; the next step will
+                    # start that image's wait.
+                    self._push_update(result)
+                    return
+
+            if result.found:
+                rx = self._region["x"] if self._region else 0
+                ry = self._region["y"] if self._region else 0
+                clicked = self._click.move_and_click(result.x + rx, result.y + ry)
+                if clicked and self._detector:
+                    self._detector.advance()
+
+        self._push_update(result)
+
+    def _wait_interruptible(self, seconds: float, on_tick=None, tick_every: float = 0.25) -> bool:
+        """Sleep in 20 ms steps, calling on_tick every `tick_every` s.
+        False if stopped, paused or FailSafe-tripped before it elapsed."""
+        deadline = time.monotonic() + seconds
+        next_tick = time.monotonic() + tick_every
+        while time.monotonic() < deadline:
+            if not self._running or self._paused:
+                return False
+            if self._click.failsafe_tripped():
+                return False
+            if on_tick and time.monotonic() >= next_tick:
+                on_tick()
+                next_tick += tick_every
+            time.sleep(0.02)
+        return self._running and not self._paused
 
     def _capture_frame(self) -> np.ndarray:
         if self._region:
@@ -203,17 +268,25 @@ class DetectionWorker:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         return frame
 
-    def _push_update(self, result: DetectionResult):
+    def _push_update(self, result: DetectionResult, waiting: bool = False):
         if self._on_update:
             status = {
+                "waiting": waiting,
                 "found": result.found,
                 "confidence": result.confidence,
                 "x": result.x,
                 "y": result.y,
+                "width": result.width,
+                "height": result.height,
+                # Absolute screen top-left of the detected box (for overlay)
+                "box_x": result.x - result.width // 2 + (self._region["x"] if self._region else 0),
+                "box_y": result.y - result.height // 2 + (self._region["y"] if self._region else 0),
                 "error": result.error,
                 "clicks": self._click.click_count,
                 "fps": round(self._fps, 1),
                 "paused": self._paused,
+                # ClickController disables itself when PyAutoGUI FailSafe fires
+                "failsafe": self._running and not self._click.enabled,
             }
             self._on_update(status)
 

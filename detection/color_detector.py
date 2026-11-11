@@ -66,9 +66,10 @@ class ColorDetector(BaseDetector):
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self._lower, self._upper)
 
-        # Red wraps around hue 180, add second range
-        if self._lower[0] <= 10:
-            lower2 = np.array([170, self._lower[1], self._lower[2]], dtype=np.uint8)
+        # Reds wrap around hue 180: a low range starting at 0 (e.g. 0-10) is
+        # mirrored to the top of the scale (170-180). Other hues are left alone.
+        if self._lower[0] == 0 and self._upper[0] <= 15:
+            lower2 = np.array([180 - int(self._upper[0]), self._lower[1], self._lower[2]], dtype=np.uint8)
             upper2 = np.array([180, self._upper[1], self._upper[2]], dtype=np.uint8)
             mask2 = cv2.inRange(hsv, lower2, upper2)
             mask = cv2.bitwise_or(mask, mask2)
@@ -95,11 +96,10 @@ class ColorDetector(BaseDetector):
         x, y, w, h = cv2.boundingRect(best)
         cx = x + w // 2
         cy = y + h // 2
-        # Confidence approximated as fill ratio of bounding box
+        # Reported confidence = fill ratio of the bounding box. It is only
+        # informational: round shapes fill ~78% of their box, so gating on the
+        # template-style threshold would reject perfectly good targets.
         confidence = min(1.0, best_area / (w * h)) if (w * h) > 0 else 0.0
-
-        if confidence < self._threshold:
-            return DetectionResult(found=False, confidence=confidence)
 
         return DetectionResult(
             found=True,

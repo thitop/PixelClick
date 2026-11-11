@@ -4,6 +4,7 @@ Draws a red rectangle while the user drags, then calls the callback with (x, y, 
 """
 
 from __future__ import annotations
+import ctypes
 import tkinter as tk
 from typing import Callable
 
@@ -83,10 +84,28 @@ class RegionSelector(tk.Toplevel):
         w = abs(end_x - self._start_x)
         h = abs(end_y - self._start_y)
 
-        self.destroy()
+        # Hide the dimming overlay and give the compositor time to repaint the
+        # real screen BEFORE the caller captures it; otherwise a snip can include
+        # the 35% black tint and never match afterwards.
+        master = self.master
+        self.withdraw()
+        self.update_idletasks()
+        try:
+            ctypes.windll.dwmapi.DwmFlush()
+        except Exception:
+            pass
 
-        if w > 10 and h > 10:
-            self._on_select(x, y, w, h)
+        def finish():
+            if self.winfo_exists():
+                self.destroy()
+            if w > 10 and h > 10:
+                self._on_select(x, y, w, h)
+            elif self._on_cancel:
+                # A click or tiny drag selects nothing: treat it as cancel so
+                # the caller brings its window back instead of staying hidden.
+                self._on_cancel()
+
+        master.after(120, finish)
 
     def _on_escape(self, event):
         self.destroy()

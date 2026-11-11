@@ -5,3 +5,6 @@ pyautogui
 pillow
 keyboard
 numpy
+svglib
+reportlab
+rlPyCairo

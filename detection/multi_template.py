@@ -22,16 +22,17 @@ class MultiTemplateDetector(BaseDetector):
     def __init__(self, templates: list[dict], threshold: float = 0.85, mode: str = "Sequential"):
         super().__init__(threshold)
         self._mode = mode
-        self._detectors: list[tuple[TemplateMatchDetector, int]] = []
+        # Each detector keeps a reference to its source dict so pre_delay_ms edits
+        # made later (from the UI) are picked up without rebuilding.
+        self._detectors: list[tuple[TemplateMatchDetector, dict]] = []
         
         for tmpl in templates:
             path = tmpl.get("path")
-            delay = tmpl.get("delay", -1)
             if not path: continue
             
             detector = TemplateMatchDetector(path, threshold)
             if detector.is_ready():
-                self._detectors.append((detector, delay))
+                self._detectors.append((detector, tmpl))
         
         log.info(f"Initialized MultiTemplateDetector with {len(self._detectors)} templates (Mode: {mode})")
         self._current_index = 0
@@ -59,16 +60,18 @@ class MultiTemplateDetector(BaseDetector):
             return DetectionResult(found=False, error="No templates loaded")
 
         if self._mode == "Sequential":
-            detector, delay = self._detectors[self._current_index]
+            detector, entry = self._detectors[self._current_index]
             res = detector.find_target(image)
             if res.found:
-                res.action_delay_ms = delay
+                res.pre_click_delay_ms = int(entry.get("pre_delay_ms", 0))
+                res.template_index = self._current_index
             return res
 
         else:  # First Found
-            for detector, delay in self._detectors:
+            for index, (detector, entry) in enumerate(self._detectors):
                 res = detector.find_target(image)
                 if res.found:
-                    res.action_delay_ms = delay
+                    res.pre_click_delay_ms = int(entry.get("pre_delay_ms", 0))
+                    res.template_index = index
                     return res
             return DetectionResult(found=False)

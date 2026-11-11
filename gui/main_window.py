@@ -1,91 +1,93 @@
 """
-gui/main_window.py — Main application window (redesigned)
+gui/main_window.py — Main application window.
+
+Layout: setup flow + actions on the left, live preview + quiet stats on the right.
+All colours / radii come from gui/theme.py.
 """
 
 from __future__ import annotations
-import sys
-import tkinter as tk
+import time
 import tkinter.filedialog as fd
 import tkinter.messagebox as mb
 import customtkinter as ctk
 import keyboard
 import cv2
 from pathlib import Path
-from PIL import Image, ImageTk
+from PIL import Image
 
 from capture.screen_capture import ScreenCapture
-from detection.template_match import TemplateMatchDetector
 from detection.multi_template import MultiTemplateDetector
 from detection.color_detector import ColorDetector
 from mouse.click_controller import ClickController
 from detection_worker import DetectionWorker
-from utils.config import load_config, save_config, get_resource_path
+from utils.config import (save_config, get_resource_path, get_config_dir,
+                          normalize_template, sanitize_config)
 from utils.logger import get_logger
+from utils.mailbox import LatestOnly
+from gui import theme as T
 from gui.settings_frame import SettingsFrame
 from gui.preview_frame import PreviewFrame
 from gui.region_selector import RegionSelector
 from gui.overlay import OverlayWindow
 from gui.mini_hud import MiniHUD
-from utils.icon_loader import load_svg_icon, load_colored_svg
+from utils.icon_loader import load_svg_icon
 
 log = get_logger("main_window")
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# ── Palette ────────────────────────────────────────────────────────────────
-BG_ROOT  = "#0D1117"
-BG_PANEL = "#161B22"
-BG_CARD  = "#1C2333"
-BORDER   = "#21262D"
-TEXT_DIM = "#6B7280"
-TEXT_LG  = "#E5E7EB"
+
+def register_hotkeys(bindings, add=None) -> list[str]:
+    """Register each (key, callback) on its own so one invalid key name does
+    not silently drop the rest. Returns the keys that failed."""
+    add = add or keyboard.add_hotkey
+    failed = []
+    for key, fn in bindings:
+        try:
+            add(key, fn)
+        except Exception as e:
+            log.warning(f"Could not register hotkey {key!r}: {e}")
+            failed.append(key)
+    return failed
 
 
-class MetricCard(ctk.CTkFrame):
-    """A single colored metric card for the status grid."""
+class Stat(ctk.CTkFrame):
+    """Label over value. Plain text, no card."""
 
-    def __init__(self, master, label_text: str, value_text: str, color: str):
-        super().__init__(master, fg_color="#1F2937", corner_radius=10, height=80)
-        self.pack_propagate(False)
+    def __init__(self, master, label: str, value: str = "—"):
+        super().__init__(master, fg_color="transparent")
+        ctk.CTkLabel(self, text=label, font=T.font(11), text_color=T.DIM,
+                     anchor="w").pack(anchor="w")
+        self._val = ctk.CTkLabel(self, text=value, font=T.font(15, True),
+                                 text_color=T.TEXT, anchor="w")
+        self._val.pack(anchor="w")
 
-        # Left Accent Line
-        accent = ctk.CTkFrame(self, fg_color=color, width=4, corner_radius=4)
-        accent.pack(side="left", fill="y", padx=(0, 10))
-
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.pack(side="left", fill="both", expand=True, pady=12)
-
-        ctk.CTkLabel(content, text=label_text,
-                     font=ctk.CTkFont("Segoe UI", 11),
-                     text_color="#9CA3AF").pack(anchor="w")
-
-        self._val_label = ctk.CTkLabel(content, text=value_text,
-                                        font=ctk.CTkFont("Segoe UI", 16, weight="bold"),
-                                        text_color=color)
-        self._val_label.pack(anchor="w", pady=(2, 0))
-
-    def set(self, text: str, color: str | None = None):
-        self._val_label.configure(text=text)
-        if color:
-            self._val_label.configure(text_color=color)
+    def set(self, text: str, color: str = T.TEXT):
+        self._val.configure(text=text, text_color=color)
 
 
 class MainWindow(ctk.CTk):
 
     APP_TITLE = "PixelClick"
-    APP_W, APP_H = 1050, 700
+    APP_W, APP_H = 1000, 760
+    LEFT_W = 340
 
     def __init__(self, config: dict):
         super().__init__()
-        self._config = config
+        self._config = sanitize_config(config)  # bad hand-edited values -> defaults
         self._running = False
         self._paused = False
         self._templates: list[dict] = []
+        self._region: tuple[int, int, int, int] | None = None
+        self._started_at: float = 0.0
+        self._status_box = LatestOnly()
+        self._compact = False  # True while the mini HUD replaces the window
+        self._resume_after_pick = False  # snip paused a running scan
 
-        self._capture   = ScreenCapture()
+        self._capture = ScreenCapture()
         self._click_ctrl = ClickController(
-            cooldown_ms=config.get("cooldown_ms", 300),
+            cooldown_ms=int(config.get("click_delay", 0.3) * 1000),
             max_clicks_per_second=config.get("max_clicks_per_second", 10),
         )
         self._worker = DetectionWorker(
@@ -96,28 +98,31 @@ class MainWindow(ctk.CTk):
 
         self._load_icons()
         self._setup_window()
-        self._overlay = OverlayWindow(self, box_color="#3B82F6")
+        self._overlay = OverlayWindow(self, box_color=T.ACCENT)
         self._mini_hud = MiniHUD(
             self,
             on_start=self._start,
             on_stop=self._stop,
             on_expand=self._exit_mini_hud,
-            icons=self._icons
+            icons=self._icons,
+            hotkeys=self._config.get("hotkeys", {}),
         )
         self._build_ui()
+        self._restore_state()
+        self._refresh_start_state()
         self._setup_hotkeys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(33, self._poll_status)
         log.info("MainWindow initialized.")
 
     def _load_icons(self):
         self._icons = {
-            "logo": ctk.CTkImage(light_image=Image.open(get_resource_path("logo/PixelClick_logo.png")), size=(24, 24)),
-            "zap": load_svg_icon("assets/icons/zap.svg", (22, 22)),
-            "play": load_svg_icon("assets/icons/play.svg", (18, 18)),
-            "square": load_svg_icon("assets/icons/square.svg", (18, 18)),
+            "logo": ctk.CTkImage(
+                light_image=Image.open(get_resource_path("logo/PixelClick_logo.png")),
+                size=(24, 24)),
+            "play": load_svg_icon("assets/icons/play.svg", (16, 16)),
+            "square": load_svg_icon("assets/icons/square.svg", (16, 16)),
             "pause": load_svg_icon("assets/icons/pause.svg", (16, 16)),
-            "bar-chart": load_svg_icon("assets/icons/bar-chart-2.svg", (16, 16)),
-            "alert": load_svg_icon("assets/icons/alert-triangle.svg", (14, 14)),
             "maximize": load_svg_icon("assets/icons/maximize.svg", (14, 14)),
         }
 
@@ -129,249 +134,255 @@ class MainWindow(ctk.CTk):
             self.iconbitmap(get_resource_path("logo/PixelClick_logo.ico"))
         except Exception as e:
             log.warning(f"Could not set window icon: {e}")
-        self.configure(fg_color=BG_ROOT)
+        self.configure(fg_color=T.BG)
         self.minsize(900, 620)
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        h = min(self.APP_H, sh - 100)  # leave room for the taskbar on small screens
         x = (sw - self.APP_W) // 2
-        y = (sh - self.APP_H) // 2
-        self.geometry(f"{self.APP_W}x{self.APP_H}+{x}+{y}")
+        y = max(0, (sh - h) // 2 - 20)
+        self.geometry(f"{self.APP_W}x{h}+{x}+{y}")
 
     # ── UI ─────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self._build_header()
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        body.pack(fill="both", expand=True, padx=T.PAD, pady=(0, T.PAD))
 
-        # Left column
-        left_pane = ctk.CTkFrame(body, fg_color="transparent", width=280)
-        left_pane.pack(side="left", fill="y", padx=(0, 8))
-        left_pane.pack_propagate(False)
+        left = ctk.CTkFrame(body, fg_color="transparent", width=self.LEFT_W)
+        left.pack(side="left", fill="y", padx=(0, T.GAP + 4))
+        left.pack_propagate(False)
 
-        # Settings (scrollable)
         self._settings_frame = SettingsFrame(
-            left_pane,
-            fg_color=BG_PANEL,
-            scrollbar_fg_color=BG_PANEL,
-            corner_radius=12,
+            left,
+            fg_color=T.SURFACE, corner_radius=T.R_PANEL,
+            scrollbar_fg_color=T.SURFACE,
+            scrollbar_button_color=T.BORDER,
+            scrollbar_button_hover_color=T.HOVER,
             on_mode_change=self._on_mode_change,
             on_confidence_change=self._on_confidence_change,
             on_delay_change=self._on_delay_change,
             on_interval_change=self._on_interval_change,
+            on_click_mode_change=self._on_click_mode_change,
             on_load_template=self._load_template,
             on_snip_template=self._snip_template,
             on_clear_templates=self._clear_templates,
+            on_remove_template=self._remove_template,
+            on_template_delay_change=self._on_template_delay,
+            on_target_mode_change=self._on_target_mode_change,
+            on_select_region=self._select_region,
+            on_clear_region=self._clear_region,
+            on_color_change=self._on_color_change,
         )
-        self._settings_frame._cbs["click_mode"] = self._on_click_mode_change
-        self._settings_frame.pack(fill="both", expand=True)
+        self._build_actions(left)          # packed first at the bottom
+        self._settings_frame.pack(fill="both", expand=True, pady=(0, T.GAP + 4))
 
-        # Control Panel (Start/Stop) fixed at bottom
-        self._build_control_panel(left_pane)
-
-        # Right
-        right = ctk.CTkFrame(body, fg_color="transparent")
+        right = ctk.CTkFrame(body, fg_color=T.SURFACE, corner_radius=T.R_PANEL)
         right.pack(side="left", fill="both", expand=True)
-
-        # Preview
-        preview_card = ctk.CTkFrame(right, fg_color=BG_PANEL, corner_radius=12)
-        preview_card.pack(fill="both", expand=True, pady=(0, 8))
-        self._preview = PreviewFrame(preview_card, fg_color="transparent")
+        self._preview = PreviewFrame(right, fg_color="transparent")
         self._preview.pack(fill="both", expand=True)
-
-        # Metric cards grid
-        self._build_metrics(right)
-
-        self._build_footer()
+        self._build_stats(right)
 
     def _build_header(self):
-        hdr = ctk.CTkFrame(self, fg_color=BG_PANEL, height=52, corner_radius=0)
-        hdr.pack(fill="x")
+        hdr = ctk.CTkFrame(self, fg_color=T.SURFACE, height=48, corner_radius=0)
+        hdr.pack(fill="x", pady=(0, T.PAD))
         hdr.pack_propagate(False)
 
-        # Logo
-        logo = ctk.CTkFrame(hdr, fg_color="transparent")
-        logo.pack(side="left", padx=16, pady=8)
+        ctk.CTkLabel(hdr, text="", image=self._icons["logo"]).pack(
+            side="left", padx=(T.PAD, 8))
+        ctk.CTkLabel(hdr, text="PixelClick", font=T.font(15, True),
+                     text_color=T.TEXT).pack(side="left")
 
-        ctk.CTkLabel(logo, text="", image=self._icons.get("logo")).pack(side="left")
-        ctk.CTkLabel(logo, text="PixelClick",
-                     font=ctk.CTkFont("Segoe UI", 18, weight="bold"),
-                     text_color="#F9FAFB").pack(side="left", padx=(4, 8))
+        ctk.CTkButton(
+            hdr, text="Compact view", image=self._icons["maximize"], compound="left",
+            width=0, height=30, fg_color=T.RAISED, hover_color=T.HOVER,
+            text_color=T.TEXT, corner_radius=T.R_CTRL, font=T.font(12),
+            command=self._enter_mini_hud,
+        ).pack(side="right", padx=T.PAD)
 
-        sep = ctk.CTkFrame(hdr, fg_color=BORDER, width=1)
-        sep.pack(side="left", fill="y", padx=0, pady=10)
+        status = ctk.CTkFrame(hdr, fg_color="transparent")
+        status.pack(side="right", padx=(0, T.PAD))
+        self._status_dot = ctk.CTkLabel(status, text="●", font=T.font(12), text_color=T.DIM)
+        self._status_dot.pack(side="left", padx=(0, 6))
+        self._status_text = ctk.CTkLabel(status, text="Stopped", font=T.font(12, True),
+                                         text_color=T.MUTED)
+        self._status_text.pack(side="left")
 
-        ctk.CTkLabel(hdr, text="Auto Click Detector  v1.0",
-                     font=ctk.CTkFont("Segoe UI", 11),
-                     text_color=TEXT_DIM).pack(side="left", padx=12)
+    def _build_actions(self, parent):
+        hk = self._config.get("hotkeys", {})
+        key = lambda name, d: hk.get(name, d).upper()
 
-        self._status_pill = ctk.CTkFrame(hdr, fg_color="#1A2636", corner_radius=20)
-        self._status_pill.pack(side="right", padx=16, pady=12)
-        self._status_dot = ctk.CTkLabel(self._status_pill, text="●",
-                                         font=ctk.CTkFont("Segoe UI", 12),
-                                         text_color="#4B5563")
-        self._status_dot.pack(side="left", padx=(10, 4))
-        self._status_text = ctk.CTkLabel(self._status_pill, text="Stopped",
-                                          font=ctk.CTkFont("Segoe UI", 12, weight="bold"),
-                                          text_color="#6B7280")
-        self._status_text.pack(side="left", padx=(0, 10))
+        bar = ctk.CTkFrame(parent, fg_color=T.SURFACE, corner_radius=T.R_PANEL)
+        bar.pack(side="bottom", fill="x")
 
-        # Mini HUD button
-        self._hud_btn = ctk.CTkButton(
-            hdr, text="", image=self._icons.get("maximize") or self._icons.get("bar-chart"),
-            width=32, height=32, corner_radius=8,
-            fg_color="#1F2937", hover_color="#374151",
-            command=self._enter_mini_hud
-        )
-        self._hud_btn.pack(side="right", padx=(0, 16))
-
-    def _build_control_panel(self, parent):
-        ctrl = ctk.CTkFrame(parent, fg_color=BG_PANEL, corner_radius=12, height=130)
-        ctrl.pack(fill="x", pady=(8, 0))
-        ctrl.pack_propagate(False)
-
-        # START / STOP row
-        row = ctk.CTkFrame(ctrl, fg_color="transparent")
-        row.pack(padx=12, pady=(16, 8), fill="x")
+        self._start_hint = ctk.CTkLabel(
+            bar, text="", height=16, font=T.font(11), text_color=T.WARN, anchor="w")
+        # Only shown (packed) while START is blocked; see _refresh_start_state.
 
         self._start_btn = ctk.CTkButton(
-            row, text=" START", image=self._icons.get("play"),
-            fg_color="#166534", hover_color="#15803D",
-            font=ctk.CTkFont("Segoe UI", 14, weight="bold"),
-            height=44, corner_radius=10,
-            command=self._start)
-        self._start_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+            bar, text=f"Start    {key('start', 'f6')}", image=self._icons["play"],
+            compound="left", height=44, corner_radius=T.R_CTRL,
+            fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER, text_color=T.ON_ACCENT,
+            text_color_disabled=T.DIM, font=T.font(14, True), command=self._start)
+        self._start_btn.pack(fill="x", padx=T.PAD, pady=(T.PAD, 0))
 
-        self._stop_btn = ctk.CTkButton(
-            row, text=" STOP", image=self._icons.get("square"),
-            fg_color="#7F1D1D", hover_color="#B91C1C",
-            font=ctk.CTkFont("Segoe UI", 14, weight="bold"),
-            height=44, corner_radius=10,
-            command=self._stop,
-            state="disabled")
-        self._stop_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
+        row = ctk.CTkFrame(bar, fg_color="transparent")
+        row.pack(fill="x", padx=T.PAD, pady=(8, 0))
+        row.grid_columnconfigure((0, 1), weight=1, uniform="c")
 
         self._pause_btn = ctk.CTkButton(
-            ctrl, text=" PAUSE", image=self._icons.get("pause"),
-            fg_color="#78350F", hover_color="#B45309",
-            font=ctk.CTkFont("Segoe UI", 13, weight="bold"),
-            height=36, corner_radius=8,
-            command=self._pause_toggle,
-            state="disabled")
-        self._pause_btn.pack(padx=12, pady=(0, 12), fill="x")
+            row, text=f"Pause    {key('pause', 'f8')}", image=self._icons["pause"],
+            compound="left", height=36, corner_radius=T.R_CTRL,
+            fg_color=T.RAISED, hover_color=T.HOVER, text_color=T.TEXT,
+            text_color_disabled=T.DIM, font=T.font(12),
+            command=self._pause_toggle, state="disabled")
+        self._pause_btn.grid(row=0, column=0, padx=(0, 4), sticky="ew")
 
-    def _build_metrics(self, parent):
-        grid_frame = ctk.CTkFrame(parent, fg_color=BG_PANEL, corner_radius=12)
-        grid_frame.pack(fill="x")
+        self._stop_btn = ctk.CTkButton(
+            row, text=f"Stop    {key('stop', 'f7')}", image=self._icons["square"],
+            compound="left", height=36, corner_radius=T.R_CTRL,
+            fg_color=T.RAISED, hover_color=T.HOVER, text_color=T.TEXT,
+            text_color_disabled=T.DIM, font=T.font(12),
+            command=self._stop, state="disabled")
+        self._stop_btn.grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        ctk.CTkLabel(grid_frame, text=" Metrics", image=self._icons.get("bar-chart"), compound="left",
-                     font=ctk.CTkFont("Segoe UI", 12, weight="bold"),
-                     text_color="#A0C4FF").pack(anchor="w", padx=14, pady=(10, 6))
+        ctk.CTkLabel(
+            bar, text="Emergency stop: move the mouse to the top-left corner.",
+            font=T.font(10), text_color=T.DIM, anchor="w",
+        ).pack(fill="x", padx=T.PAD, pady=(8, 12))
 
-        cards_row = ctk.CTkFrame(grid_frame, fg_color="transparent")
-        cards_row.pack(fill="x", padx=10, pady=(0, 10))
+    def _build_stats(self, parent):
+        ctk.CTkFrame(parent, fg_color=T.BORDER, height=1).pack(fill="x")
+        strip = ctk.CTkFrame(parent, fg_color="transparent")
+        strip.pack(fill="x", padx=T.PAD, pady=12)
+        self._stats: dict[str, Stat] = {}
+        for i, label in enumerate(("Target", "Confidence", "Clicks", "Elapsed", "Scans/s")):
+            s = Stat(strip, label)
+            s.grid(row=0, column=i, sticky="w", padx=(0, 8))
+            strip.grid_columnconfigure(i, weight=1, uniform="s")
+            self._stats[label] = s
+        self._stats["Clicks"].set("0")
+        self._stats["Elapsed"].set("00:00")
 
-        metrics_cfg = [
-            ("Target",     "Not Found", "#EF4444"),
-            ("Confidence", "0.00%",     "#60A5FA"),
-            ("Clicks",     "0",         "#34D399"),
-            ("FPS",        "0",         "#A78BFA"),
-            ("Template",   "None",      "#6B7280"),
-            ("Time",       "00:00",     "#F59E0B"), # Just a placeholder since we removed Region
-        ]
+    # ── Start button state ─────────────────────────────────────────────
 
-        self._cards: dict[str, MetricCard] = {}
-        for i, (label, default, color) in enumerate(metrics_cfg):
-            card = MetricCard(cards_row, label_text=label, value_text=default, color=color)
-            card.grid(row=i // 3, column=i % 3, padx=4, pady=4, sticky="nsew")
-            self._cards[label] = card
-
-        for c in range(3):
-            cards_row.grid_columnconfigure(c, weight=1)
-
-    def _build_footer(self):
-        ftr = ctk.CTkFrame(self, fg_color=BG_PANEL, height=28, corner_radius=0)
-        ftr.pack(fill="x", side="bottom")
-        ftr.pack_propagate(False)
-        ctk.CTkLabel(ftr,
-                     text=" FailSafe: Move mouse to top-left corner to emergency stop",
-                     image=self._icons.get("alert"), compound="left",
-                     font=ctk.CTkFont("Segoe UI", 9),
-                     text_color="#374151").pack(side="left", padx=14)
+    def _refresh_start_state(self):
+        """Enable START only when it can work; say why when it cannot."""
+        if self._running:
+            return
+        blocked = ""
+        if self._settings_frame.get_mode() == "Template Matching" and not self._templates:
+            blocked = "Add or snip an image first."
+        self._start_hint.configure(text=blocked)
+        if blocked:
+            self._start_hint.pack(fill="x", padx=T.PAD, pady=(12, 0), before=self._start_btn)
+            self._start_btn.configure(state="disabled", fg_color=T.RAISED)
+        else:
+            self._start_hint.pack_forget()
+            self._start_btn.configure(state="normal", fg_color=T.ACCENT)
 
     # ── Hotkeys ────────────────────────────────────────────────────────
 
     def _setup_hotkeys(self):
         hk = self._config.get("hotkeys", {})
-        try:
-            keyboard.add_hotkey(hk.get("start", "f6"),          self._start)
-            keyboard.add_hotkey(hk.get("stop",  "f7"),          self._stop)
-            keyboard.add_hotkey(hk.get("pause", "f8"),          self._pause_toggle)
-            keyboard.add_hotkey(hk.get("snip_template", "f10"), self._snip_template)
+
+        # `keyboard` fires callbacks on its own thread; tkinter is not
+        # thread-safe, so marshal every action onto the Tk main loop.
+        def on_main(fn):
+            return lambda: self.after(0, fn)
+
+        failed = register_hotkeys([
+            (hk.get("start", "f6"),          on_main(self._start)),
+            (hk.get("stop",  "f7"),          on_main(self._stop)),
+            (hk.get("pause", "f8"),          on_main(self._pause_toggle)),
+            (hk.get("select_region", "f9"),  on_main(self._select_region)),
+            (hk.get("snip_template", "f10"), on_main(self._snip_template)),
+        ])
+        if failed:
+            self._set_status(f"Invalid hotkey in settings: {', '.join(failed)}", T.WARN)
+        else:
             log.info("Global hotkeys registered.")
-        except Exception as e:
-            log.warning(f"Could not register hotkeys: {e}")
 
     # ── Worker callback ────────────────────────────────────────────────
 
     def _on_worker_update(self, status: dict):
-        self.after(0, self._apply_status, status)
+        # Called on the worker thread: never touch Tk here (a cross-thread
+        # after() blocks until the Tk loop is free, which deadlocks with
+        # Stop's join). Just drop the newest status in the mailbox.
+        self._status_box.put(status)
+
+    def _poll_status(self):
+        status = self._status_box.take()
+        if status is not None:
+            self._apply_status(status)
+        self.after(33, self._poll_status)
 
     def _apply_status(self, status: dict):
-        found      = status.get("found", False)
-        conf       = status.get("confidence", 0.0)
-        clicks     = status.get("clicks", 0)
-        fps        = status.get("fps", 0.0)
-        x, y       = status.get("x", 0), status.get("y", 0)
-        error      = status.get("error", "")
+        if not self._running:
+            return  # late update queued before STOP; ignore
+        if status.get("failsafe"):
+            log.warning("FailSafe triggered — stopping.")
+            self._stop()
+            self._set_status("FailSafe triggered", T.ERR)
+            return
 
-        if error:
-            self._cards["Target"].set(f"⚠ Error", "#F87171")
+        found = status.get("found", False)
+        conf = status.get("confidence", 0.0)
+
+        if status.get("error"):
+            self._stats["Target"].set("Error", T.ERR)
+        elif status.get("paused"):
+            self._stats["Target"].set("Paused", T.MUTED)
+        elif status.get("waiting"):
+            self._stats["Target"].set("Waiting", T.WARN)
         elif found:
-            self._cards["Target"].set("Found ✓", "#22C55E")
+            self._stats["Target"].set("Found", T.OK)
         else:
-            self._cards["Target"].set("Not Found", "#9CA3AF")
+            self._stats["Target"].set("Searching", T.MUTED)
 
-        self._cards["Confidence"].set(f"{conf:.1%}")
-        self._cards["Clicks"].set(str(clicks))
-        self._cards["FPS"].set(f"{fps:.0f}")
+        self._stats["Confidence"].set(f"{conf:.0%}" if conf > 0 else "—")
+        self._stats["Clicks"].set(str(status.get("clicks", 0)))
+        self._stats["Scans/s"].set(f"{status.get('fps', 0.0):.0f}")
+        self._stats["Elapsed"].set(self._elapsed_text())
 
-        frame = self._worker.last_frame
-        self._preview.update_frame(frame, found, x, y, conf)
+        self._preview.update_frame(
+            self._worker.last_frame, found,
+            status.get("x", 0), status.get("y", 0), conf)
 
-        # Update Overlay
-        if self._running and self._settings_frame.get_overlay_enabled():
+        if self._settings_frame.get_overlay_enabled():
             if not self._overlay._is_showing:
                 self._overlay.show()
-                
-            x = status.get("x", 0)
-            y = status.get("y", 0)
-            w = status.get("width", 0)
-            h = status.get("height", 0)
-            self._overlay.update_target(found, x, y, w, h)
-        else:
-            if self._overlay._is_showing:
-                self._overlay.hide()
+            self._overlay.update_target(
+                found,
+                status.get("box_x", 0), status.get("box_y", 0),
+                status.get("width", 0), status.get("height", 0),
+            )
+        elif self._overlay._is_showing:
+            self._overlay.hide()
 
-        # Update Mini HUD
-        if hasattr(self, "_mini_hud"):
-            self._mini_hud.update_status(self._running, self._click_ctrl.click_count)
+        self._mini_hud.update_status(self._running, self._click_ctrl.click_count, self._paused)
 
     # ── Controls ───────────────────────────────────────────────────────
 
     def _start(self):
         if self._running:
             return
+        self._settings_frame.commit_pending()
         if not self._build_detector():
             return
+        self._status_box.take()  # drop any status left over from the last run
+        if not self._worker.start():
+            self._set_status("Still stopping, try again", T.WARN)
+            return
         self._running = True
-        self._worker.start()
-        
-        self._start_btn.configure(state="disabled", fg_color="#0F3B20")
-        self._stop_btn.configure(state="normal", fg_color="#7F1D1D")
+        self._started_at = time.monotonic()
+
+        self._start_hint.pack_forget()
+        self._start_btn.configure(state="disabled", fg_color=T.RAISED)
+        self._stop_btn.configure(state="normal", text_color=T.ERR)
         self._pause_btn.configure(state="normal")
-        
-        self._set_status("Running", "#22C55E")
+        self._set_status("Running", T.OK)
 
     def _stop(self):
         if not self._running:
@@ -379,26 +390,23 @@ class MainWindow(ctk.CTk):
         self._running = False
         self._paused = False
         self._worker.stop()
-        
+
         if self._overlay._is_showing:
             self._overlay.hide()
-        
-        self._start_btn.configure(state="normal", fg_color="#166534")
-        self._stop_btn.configure(state="disabled", fg_color="#1F2937")
-        self._pause_btn.configure(state="disabled", text="⏸  PAUSE", image=self._icons.get("pause"))
-        
-        self._set_status("Stopped", "#9CA3AF")
-        self._preview.clear()
 
-    def _enter_mini_hud(self):
-        """Hides main window and shows mini HUD"""
-        self.withdraw()
-        self._mini_hud.show()
-        
-    def _exit_mini_hud(self):
-        """Hides mini HUD and shows main window"""
-        self._mini_hud.hide()
-        self.deiconify()
+        self._stop_btn.configure(state="disabled", text_color=T.TEXT)
+        self._pause_btn.configure(
+            state="disabled", text=self._pause_text("Pause"), image=self._icons["pause"])
+        self._set_status("Stopped", T.MUTED)
+        self._preview.clear()
+        for k in ("Target", "Confidence", "Scans/s"):
+            self._stats[k].set("—")
+        self._mini_hud.update_status(False, self._click_ctrl.click_count)
+        self._refresh_start_state()
+
+    def _pause_text(self, word: str) -> str:
+        key = self._config.get("hotkeys", {}).get("pause", "f8").upper()
+        return f"{word}    {key}"
 
     def _pause_toggle(self):
         if not self._running:
@@ -406,64 +414,168 @@ class MainWindow(ctk.CTk):
         self._paused = not self._paused
         if self._paused:
             self._worker.pause()
-            self._set_status("Paused", "#F59E0B")
-            self._pause_btn.configure(text=" RESUME", image=self._icons.get("play"))
+            self._set_status("Paused", T.WARN)
+            self._pause_btn.configure(text=self._pause_text("Resume"), image=self._icons["play"])
         else:
             self._worker.resume()
-            self._set_status("Running", "#22C55E")
-            self._pause_btn.configure(text=" PAUSE", image=self._icons.get("pause"))
+            self._set_status("Running", T.OK)
+            self._pause_btn.configure(text=self._pause_text("Pause"), image=self._icons["pause"])
+        self._mini_hud.update_status(True, self._click_ctrl.click_count, self._paused)
+
+    def _elapsed_text(self) -> str:
+        secs = int(time.monotonic() - self._started_at)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def _enter_mini_hud(self):
+        self._compact = True
+        self.withdraw()
+        self._mini_hud.show()
+
+    def _exit_mini_hud(self):
+        self._compact = False
+        self._mini_hud.hide()
+        self.deiconify()
+
+    def _hide_for_screen_pick(self):
+        """Hide whatever PixelClick has on screen so it is not in the pick/snip."""
+        self.withdraw()
+        if self._compact:
+            self._mini_hud.hide()
+
+    def _restore_after_screen_pick(self):
+        if self._compact:
+            self._mini_hud.show()
+        else:
+            self.deiconify()
+        if self._resume_after_pick:
+            self._resume_after_pick = False
+            if self._running and self._paused:
+                self._pause_toggle()
+
+    def _show_error(self, title: str, message: str):
+        """Error dialogs need a visible parent; leave compact view first."""
+        if self._compact:
+            self._exit_mini_hud()
+        mb.showerror(title, message, parent=self)
 
     def _build_detector(self) -> bool:
-        mode       = self._settings_frame.get_mode()
-        confidence = self._settings_frame.get_confidence()
-        delay_sec  = self._settings_frame.get_delay()
+        sf = self._settings_frame
+        mode = sf.get_mode()
 
-        self._click_ctrl.cooldown_ms   = int(delay_sec * 1000)
-        self._click_ctrl.click_mode    = self._settings_frame.get_click_mode()
-        self._worker.set_interval_ms(
-            int(self._settings_frame._interval_var.get().replace(" ms", ""))
-        )
-        self._worker.clear_region()
+        self._click_ctrl.cooldown_ms = int(sf.get_delay() * 1000)
+        self._click_ctrl.click_mode = sf.get_click_mode()
+        self._worker.set_interval_ms(sf.get_interval_ms())
+
+        if self._region:
+            self._worker.set_region(*self._region)
+        else:
+            self._worker.clear_region()
 
         if mode == "Template Matching":
             if not self._templates:
-                mb.showerror("No Templates",
-                             "Please load or snip at least one template image first.",
-                             parent=self)
+                self._show_error("No images", "Add or snip at least one image first.")
                 return False
-            
-            target_mode = self._settings_frame.get_target_mode()
-            detector = MultiTemplateDetector(self._templates, threshold=confidence, mode=target_mode)
+            detector = self._make_template_detector()
+            if not detector.is_ready():
+                self._show_error("Images could not be loaded",
+                                 "None of the images could be read. Check that the files still exist.")
+                return False
         else:
-            detector = ColorDetector(threshold=confidence)
+            cd = sf.get_color_range()
+            detector = ColorDetector(
+                hue_min=cd["hue_min"], hue_max=cd["hue_max"],
+                sat_min=cd["sat_min"], sat_max=cd["sat_max"],
+                val_min=cd["val_min"], val_max=cd["val_max"],
+                threshold=sf.get_confidence(),
+            )
 
         self._worker.set_detector(detector)
         return True
 
+    def _make_template_detector(self) -> MultiTemplateDetector:
+        sf = self._settings_frame
+        return MultiTemplateDetector(
+            self._templates, threshold=sf.get_confidence(), mode=sf.get_target_mode())
+
+    # ── Templates ──────────────────────────────────────────────────────
+
+    def _on_templates_changed(self):
+        self._settings_frame.set_template_list(self._templates)
+        if self._running and self._settings_frame.get_mode() == "Template Matching":
+            # Keep the running scan in step with the list on screen.
+            if not self._templates:
+                self._stop()
+                self._set_status("Stopped: no images left", T.WARN)
+                return
+            detector = self._make_template_detector()
+            if detector.is_ready():
+                self._worker.set_detector(detector)
+            else:
+                log.warning("Updated image list could not be loaded; keeping the previous one.")
+        self._refresh_start_state()
+
+    def _add_template(self, path: Path):
+        self._templates.append({"path": path, "pre_delay_ms": 0})
+        self._on_templates_changed()
+        log.info(f"Template added: {path}")
+
     def _load_template(self):
-        path = fd.askopenfilename(
-            title="Select Template Image",
+        paths = fd.askopenfilenames(
+            title="Select target image",
             filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp"),
                        ("All files", "*.*")],
             parent=self)
-        if path:
-            p = Path(path)
-            delay_ms = int(self._settings_frame.get_delay() * 1000)
-            self._templates.append({"path": p, "delay": delay_ms})
-            self._cards["Template"].set(f"{len(self._templates)} loaded", "#A78BFA")
-            self._settings_frame.set_template_list(self._templates)
-            log.info(f"Template added: {path} (Delay: {delay_ms}ms)")
+        for p in paths:
+            self._add_template(Path(p))
+
+    def _on_template_delay(self, index: int, seconds: float):
+        """A row's 'before click' field changed. The detector reads the same
+        dict, so this takes effect immediately, even while running."""
+        if 0 <= index < len(self._templates):
+            self._templates[index]["pre_delay_ms"] = int(round(seconds * 1000))
+
+    def _remove_template(self, index: int):
+        if 0 <= index < len(self._templates):
+            removed = self._templates.pop(index)
+            log.info(f"Template removed: {removed['path']}")
+            self._on_templates_changed()
 
     def _clear_templates(self):
         self._templates.clear()
-        self._cards["Template"].set("None", "#6B7280")
-        self._settings_frame.set_template_list(self._templates)
+        self._on_templates_changed()
         log.info("Cleared all templates.")
 
-    # ── Snip Template ──────────────────────────────────────────────────
+    # ── Capture region ─────────────────────────────────────────────────
+
+    def _select_region(self):
+        if self._running:
+            return  # region is applied on START; avoid changing it mid-run
+        self._hide_for_screen_pick()
+        self.after(200, lambda: RegionSelector(
+            self, on_select=self._on_region_selected,
+            on_cancel=self._on_snip_cancel))
+
+    def _on_region_selected(self, x, y, w, h):
+        self.after(0, self._restore_after_screen_pick)
+        self._region = (x, y, w, h)
+        self._settings_frame.set_region_label(f"{w} × {h} at ({x}, {y})")
+        log.info(f"Capture region set: {self._region}")
+
+    def _clear_region(self):
+        self._region = None
+        self._settings_frame.set_region_label("Whole screen")
+
+    # ── Snip template ──────────────────────────────────────────────────
 
     def _snip_template(self):
-        self.withdraw()
+        # Snipping while running: pause clicking so the worker does not move
+        # the mouse while the user drags; resume afterwards (only if we paused).
+        if self._running and not self._paused:
+            self._pause_toggle()
+            self._resume_after_pick = True
+        self._hide_for_screen_pick()
         self.after(200, self._open_snip_selector)
 
     def _open_snip_selector(self):
@@ -471,39 +583,32 @@ class MainWindow(ctk.CTk):
                        on_cancel=self._on_snip_cancel)
 
     def _on_snip_selected(self, x, y, w, h):
-        self.after(0, self.deiconify)
+        self.after(0, self._restore_after_screen_pick)
         try:
             frame = self._capture.capture_region(x, y, w, h)
-            # Create data folder if not exists
-            data_dir = Path("data")
-            # Save snippet with unique name
-            import time
-            timestamp = int(time.time())
-            path = data_dir / f"snip_{timestamp}.png"
-            
-            # Save snippet
-            cv2.imwrite(str(path), frame)
-            
-            # Add to template list
-            p = path.absolute()
-            delay_ms = int(self._settings_frame.get_delay() * 1000)
-            self._templates.append({"path": p, "delay": delay_ms})
-            self._cards["Template"].set(f"{len(self._templates)} loaded", "#A78BFA")
-            self._settings_frame.set_template_list(self._templates)
-            log.info(f"Snipped template saved to {p} (Delay: {delay_ms}ms)")
-            
-            # Auto-switch mode
-            self._settings_frame._mode_var.set("Template Matching")
-            self._settings_frame._cb("mode", "Template Matching")
-            
+            data_dir = get_config_dir().parent / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            path = data_dir / f"snip_{time.time_ns() // 1_000_000}.png"  # ms: two snips in a second must not overwrite
+
+            # imencode so non-ASCII paths work
+            ok, buf = cv2.imencode(".png", frame)
+            if not ok:
+                raise RuntimeError("PNG encode failed")
+            buf.tofile(str(path))
+
+            self._add_template(path.absolute())
+            if self._settings_frame.get_mode() != "Template Matching":
+                self._settings_frame.set_mode("Template Matching")
+                self._on_mode_change("Template Matching")  # also retargets a running scan
+            self._refresh_start_state()
         except Exception as e:
             log.error(f"Failed to snip template: {e}")
-            mb.showerror("Snip Error", f"Could not save snipped template:\n{e}")
+            self._show_error("Snip failed", f"Could not save the snipped image:\n{e}")
 
     def _on_snip_cancel(self):
-        self.after(0, self.deiconify)
+        self.after(0, self._restore_after_screen_pick)
 
-    # ── Status pill ────────────────────────────────────────────────────
+    # ── Status ─────────────────────────────────────────────────────────
 
     def _set_status(self, text: str, color: str):
         self._status_dot.configure(text_color=color)
@@ -513,10 +618,33 @@ class MainWindow(ctk.CTk):
 
     def _on_mode_change(self, mode: str):
         log.debug(f"Mode: {mode}")
+        if self._running:
+            # Keep the running scan in step with what the panel shows.
+            if mode == "Template Matching" and not self._templates:
+                self._stop()
+                self._set_status("Stopped: no images to look for", T.WARN)
+                return
+            if not self._build_detector():
+                self._stop()
+                return
+        self._refresh_start_state()
+
+    def _on_target_mode_change(self, order: str):
+        if self._running and self._settings_frame.get_mode() == "Template Matching":
+            detector = self._make_template_detector()
+            if detector.is_ready():
+                self._worker.set_detector(detector)
 
     def _on_confidence_change(self, value: float):
         if self._worker._detector:
             self._worker._detector.threshold = value
+
+    def _on_color_change(self, rng: dict):
+        self._config["color_detection"] = dict(rng)
+        det = self._worker._detector
+        if isinstance(det, ColorDetector):  # apply live while running
+            det.set_color_range(rng["hue_min"], rng["hue_max"], rng["sat_min"],
+                                rng["sat_max"], rng["val_min"], rng["val_max"])
 
     def _on_delay_change(self, value: float):
         self._click_ctrl.cooldown_ms = int(value * 1000)
@@ -528,14 +656,45 @@ class MainWindow(ctk.CTk):
         self._click_ctrl.click_mode = mode
         log.info(f"Click mode: {mode}")
 
-    # ── Config / Lifecycle ─────────────────────────────────────────────
+    # ── Config / lifecycle ─────────────────────────────────────────────
+
+    def _restore_state(self):
+        """Re-apply settings, region and templates saved by the last session."""
+        sf = self._settings_frame
+        sf.set_confidence(self._config.get("confidence", 0.85))
+        sf.set_delay(self._config.get("click_delay", 0.30))
+        sf.set_color_range(self._config.get("color_detection", {}))
+        sf.set_overlay_enabled(self._config.get("overlay", True))
+
+        region = self._config.get("region")
+        if isinstance(region, (list, tuple)) and len(region) == 4:
+            self._region = tuple(int(v) for v in region)
+            x, y, w, h = self._region
+            sf.set_region_label(f"{w} × {h} at ({x}, {y})")
+
+        for t in self._config.get("templates", []):
+            if not t.get("path"):
+                continue
+            tmpl = normalize_template(t)
+            if tmpl["path"].is_file():
+                self._templates.append(tmpl)
+            else:
+                log.warning(f"Saved template missing, skipped: {tmpl['path']}")
+        if self._templates:
+            sf.set_template_list(self._templates)
 
     def _save_config_state(self):
         self._config["confidence"]  = self._settings_frame.get_confidence()
         self._config["click_delay"] = self._settings_frame.get_delay()
+        self._config["overlay"]     = self._settings_frame.get_overlay_enabled()
+        self._config["region"]      = list(self._region) if self._region else None
+        self._config["templates"]   = [
+            {"path": str(t["path"]), "pre_delay_ms": t["pre_delay_ms"]} for t in self._templates
+        ]
         save_config(self._config)
 
     def _on_close(self):
+        self._settings_frame.commit_pending()
         self._stop()
         try:
             keyboard.unhook_all()

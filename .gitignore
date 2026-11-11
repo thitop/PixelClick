@@ -23,7 +23,14 @@ dist/
 *.sln
 *.sw?
 
+# Runtime data
+logs/
+data/snip_*.png
+
 # Project specific
 test_*.png
 scratch_*.py
 AutoClick_Development_Plan.md
+
+# Personal / machine-specific (the app recreates defaults when missing)
+config/settings.json

@@ -16,8 +16,8 @@ _WARN_THROTTLE_SEC = 5.0  # Log the same warning at most once per N seconds
 
 class TemplateMatchDetector(BaseDetector):
     """
-    Detects a target image inside a screenshot using OpenCV matchTemplate.
-    Supports multi-scale detection for slight size differences.
+    Detects a target image inside a screenshot using OpenCV matchTemplate
+    (grayscale, single scale, best match only).
     """
 
     def __init__(self, template_path: str | Path | None = None, threshold: float = 0.85):
@@ -37,7 +37,12 @@ class TemplateMatchDetector(BaseDetector):
             log.error(f"Template not found: {path}")
             return False
 
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        # cv2.imread cannot open non-ASCII paths on Windows; decode from bytes.
+        try:
+            data = np.fromfile(str(path), dtype=np.uint8)
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+        except OSError:
+            img = None
         if img is None:
             log.error(f"Failed to read template image: {path}")
             return False
@@ -71,10 +76,20 @@ class TemplateMatchDetector(BaseDetector):
                 self._last_warn_time = now
             return DetectionResult(found=False, error="Template larger than region")
 
-        result = cv2.matchTemplate(img_gray, self._template_gray, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if float(self._template_gray.std()) < 1e-3:
+            # Flat (single-colour) template: correlation is undefined and OpenCV
+            # reports a bogus 1.0 anywhere, so compare by squared difference.
+            # Confidence = 1 - RMSE/32 gray levels (0.85 tolerates ~5 levels).
+            result = cv2.matchTemplate(img_gray, self._template_gray, cv2.TM_SQDIFF)
+            min_val, _, min_loc, _ = cv2.minMaxLoc(result)
+            rmse = float(np.sqrt(max(0.0, min_val) / (th * tw)))
+            max_val = max(0.0, 1.0 - rmse / 32.0)
+            max_loc = min_loc
+        else:
+            result = cv2.matchTemplate(img_gray, self._template_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
-        confidence = float(max_val)
+        confidence = float(max_val) if np.isfinite(max_val) else 0.0
         if confidence < self._threshold:
             return DetectionResult(found=False, confidence=confidence)
 

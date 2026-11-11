@@ -1,5 +1,6 @@
 """
-gui/preview_frame.py — Live detection preview panel (redesigned)
+gui/preview_frame.py — Live preview of what the detector is seeing.
+The canvas fills the available space and scales the frame to fit.
 """
 
 from __future__ import annotations
@@ -9,108 +10,70 @@ from PIL import Image, ImageTk
 import numpy as np
 import cv2
 
+from gui import theme as T
+
+_CANVAS_BG = "#0A0D12"
+
 
 class PreviewFrame(ctk.CTkFrame):
-    """Live annotated-frame preview with detection overlay info."""
 
-    PREVIEW_W = 480
-    PREVIEW_H = 290
+    IDLE_TEXT = "Preview appears here once you press Start."
 
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
         self._photo: ImageTk.PhotoImage | None = None
+        self._has_frame = False
         self._build_ui()
 
     def _build_ui(self):
-        # Header row
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=14, pady=(12, 6))
+        header.pack(fill="x", padx=T.PAD, pady=(T.PAD - 2, 8))
+        ctk.CTkLabel(header, text="Preview", font=T.font(13, True),
+                     text_color=T.TEXT).pack(side="left")
+        self._state = ctk.CTkLabel(header, text="Not running", font=T.font(12),
+                                   text_color=T.DIM)
+        self._state.pack(side="right")
 
-        ctk.CTkLabel(header, text="🎯  Detection Preview",
-                     font=ctk.CTkFont("Segoe UI", 13, weight="bold"),
-                     text_color="#A0C4FF").pack(side="left")
+        wrap = ctk.CTkFrame(self, fg_color=_CANVAS_BG, corner_radius=T.R_CTRL)
+        wrap.pack(fill="both", expand=True, padx=T.PAD, pady=(0, T.PAD))
+        self._canvas = tk.Canvas(wrap, bg=_CANVAS_BG, highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True, padx=2, pady=2)
+        self._canvas.bind("<Configure>", lambda e: self._draw_placeholder())
+        self._draw_placeholder()
 
-        self._live_badge = ctk.CTkLabel(header, text="● IDLE",
-                                         font=ctk.CTkFont("Segoe UI", 10, weight="bold"),
-                                         text_color="#4B5563")
-        self._live_badge.pack(side="right")
-
-        # Canvas
-        canvas_container = ctk.CTkFrame(self, fg_color="#0A0F14", corner_radius=10,
-                                         border_color="#21262D", border_width=1)
-        canvas_container.pack(padx=14, pady=(0, 8), fill="both", expand=True)
-
-        self._canvas = tk.Canvas(canvas_container,
-                                  width=self.PREVIEW_W, height=self.PREVIEW_H,
-                                  bg="#0A0F14", highlightthickness=0)
-        self._canvas.pack(padx=2, pady=2)
-
-        self._placeholder = self._canvas.create_text(
-            self.PREVIEW_W // 2, self.PREVIEW_H // 2,
-            text="No capture running",
-            fill="#2D3748", font=("Segoe UI", 13))
-
-        # Info bar
-        info_bar = ctk.CTkFrame(self, fg_color="#0D1117", corner_radius=8)
-        info_bar.pack(padx=14, pady=(0, 10), fill="x")
-
-        self._pos_var  = tk.StringVar(value="Position:  —")
-        self._conf_var = tk.StringVar(value="Confidence:  —")
-
-        ctk.CTkLabel(info_bar, textvariable=self._pos_var,
-                     font=ctk.CTkFont("Segoe UI Mono", 11),
-                     text_color="#60A5FA").pack(side="left", padx=12, pady=6)
-
-        ctk.CTkLabel(info_bar, textvariable=self._conf_var,
-                     font=ctk.CTkFont("Segoe UI Mono", 11),
-                     text_color="#34D399").pack(side="right", padx=12, pady=6)
+    def _draw_placeholder(self):
+        if self._has_frame:
+            return
+        self._canvas.delete("all")
+        w, h = self._canvas.winfo_width(), self._canvas.winfo_height()
+        self._canvas.create_text(w // 2, h // 2, text=self.IDLE_TEXT,
+                                 fill=T.DIM, font=("Segoe UI", 12))
 
     def update_frame(self, frame: np.ndarray | None, found: bool,
                      x: int, y: int, confidence: float):
         """Update preview. Must be called from the main (Tk) thread."""
-        # Update live badge
-        if frame is not None:
-            if found:
-                self._live_badge.configure(text="● FOUND", text_color="#22C55E")
-            else:
-                self._live_badge.configure(text="● SCANNING", text_color="#F59E0B")
-        else:
-            self._live_badge.configure(text="● IDLE", text_color="#4B5563")
-
         if frame is None:
-            self._canvas.itemconfigure(self._placeholder, state="normal")
-            self._pos_var.set("Position:  —")
-            self._conf_var.set("Confidence:  —")
+            self.clear()
             return
 
-        self._canvas.itemconfigure(self._placeholder, state="hidden")
+        self._has_frame = True
+        self._state.configure(text="Found" if found else "Searching",
+                              text_color=T.OK if found else T.MUTED)
 
+        cw = max(100, self._canvas.winfo_width())
+        ch = max(100, self._canvas.winfo_height())
         h, w = frame.shape[:2]
-        scale = min(self.PREVIEW_W / w, self.PREVIEW_H / h)
-        nw, nh = int(w * scale), int(h * scale)
+        scale = min(cw / w, ch / h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
         resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
-        canvas_img = Image.new("RGB", (self.PREVIEW_W, self.PREVIEW_H), (10, 15, 20))
-        ox, oy = (self.PREVIEW_W - nw) // 2, (self.PREVIEW_H - nh) // 2
-        canvas_img.paste(Image.fromarray(rgb), (ox, oy))
-
-        self._photo = ImageTk.PhotoImage(canvas_img)
-        self._canvas.create_image(0, 0, anchor="nw", image=self._photo)
-
-        # Info bar
-        if found:
-            self._pos_var.set(f"Position:  X={x}  Y={y}")
-            self._conf_var.set(f"Confidence:  {confidence:.1%}")
-        else:
-            self._pos_var.set("Position:  —")
-            self._conf_var.set(f"Confidence:  {confidence:.1%}" if confidence > 0 else "Confidence:  —")
+        self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self._canvas.delete("all")
+        self._canvas.create_image(cw // 2, ch // 2, anchor="center", image=self._photo)
 
     def clear(self):
-        self._canvas.delete("all")
-        self._placeholder = self._canvas.create_text(
-            self.PREVIEW_W // 2, self.PREVIEW_H // 2,
-            text="No capture running", fill="#2D3748", font=("Segoe UI", 13))
-        self._live_badge.configure(text="● IDLE", text_color="#4B5563")
-        self._pos_var.set("Position:  —")
-        self._conf_var.set("Confidence:  —")
+        self._has_frame = False
+        self._photo = None
+        self._state.configure(text="Not running", text_color=T.DIM)
+        self._draw_placeholder()

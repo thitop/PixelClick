@@ -10,6 +10,10 @@ ROOT = Path(__file__).parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from mouse.click_controller import enable_dpi_awareness
+
+enable_dpi_awareness()  # must run before any window is created
+
 from utils.config import load_config
 from utils.logger import get_logger
 from gui.main_window import MainWindow
